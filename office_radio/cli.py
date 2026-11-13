@@ -5,6 +5,7 @@ Setup
   login                         one-time browser sign-in (run on your laptop)
 Read-only jobs
   discover | sync | reconcile   run one job now
+  refresh                       run discover, sync and reconcile in order
   scheduler [--once]            run jobs on their schedules
   report                        show the monitoring report
 Review
@@ -22,6 +23,7 @@ Settings
   settings patterns add|remove TEXT
   settings schedule JOB SECONDS
   settings enable-writes --confirm | disable-writes
+  settings auto-approve-inbox on|off [--hold-explicit]
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ import logging
 import os
 import sys
 
-from . import jobs, maintenance
+from . import jobs, maintenance, persist
 from .maintenance import WritesDisabled
 from .spotify.auth import AuthError
 from .spotify.client import SpotifyAPIError
@@ -58,7 +60,7 @@ def _print(obj) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="office_radio")
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("check", "login", "discover", "sync", "reconcile", "report", "apply"):
+    for name in ("check", "login", "discover", "sync", "reconcile", "refresh", "report", "apply"):
         sub.add_parser(name)
     s = sub.add_parser("scheduler")
     s.add_argument("--once", action="store_true")
@@ -87,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
     sch.add_argument("seconds", type=int)
     st.add_parser("enable-writes").add_argument("--confirm", action="store_true")
     st.add_parser("disable-writes")
+    aa = st.add_parser("auto-approve-inbox")
+    aa.add_argument("state", choices=["on", "off"])
+    aa.add_argument("--hold-explicit", action="store_true",
+                    help="explicit songs wait for manual approval")
     return p
 
 
@@ -96,6 +102,9 @@ def main(argv: list[str] | None = None) -> int:
     except (AuthError, SpotifyAPIError, WritesDisabled, ValueError, KeyError, RuntimeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        # Save any changes when data lives on a Chalk Volume (no-op otherwise).
+        persist.commit(Settings.from_env().data_dir)
 
 
 def _main(argv: list[str] | None = None) -> int:
@@ -162,6 +171,15 @@ def _main(argv: list[str] | None = None) -> int:
         elif args.action == "disable-writes":
             store.set_setting("writes_enabled", False, me)
             print("Spotify writes disabled.")
+        elif args.action == "auto-approve-inbox":
+            on = args.state == "on"
+            store.set_setting("auto_approve_inbox", on, me)
+            store.set_setting("auto_approve_hold_explicit", on and args.hold_explicit, me)
+            print(f"Inbox auto-approve {'ON' if on else 'OFF'}"
+                  + (" (explicit songs held for approval)" if on and args.hold_explicit else ""))
+            if on and not store.get_setting("writes_enabled", False):
+                print("Note: writes are disabled, so nothing will be added until you run "
+                      "`settings enable-writes --confirm`.")
         return 0
 
     spotify = make_spotify(settings, store)
@@ -174,8 +192,23 @@ def _main(argv: list[str] | None = None) -> int:
         res = jobs.run_job(job, spotify, store, settings.alert_webhook)
         _print(res)
         return 0 if res["status"] == "success" else 1
+    elif args.cmd == "refresh":
+        status = 0
+        for job in ("discovery", "source_sync", "reconciliation"):
+            res = jobs.run_job(job, spotify, store, settings.alert_webhook)
+            print(f"{job}: {res['status']}" + (f" - {res.get('error')}" if res["status"] != "success" else ""))
+            if res["status"] != "success":
+                status = 1
+                break
+        else:
+            details = store.one("SELECT details FROM playlist_sync_history WHERE job='reconciliation' "
+                                "ORDER BY run_id DESC LIMIT 1")["details"]
+            _print(json.loads(details).get("inbox_auto_approve"))
+        return status
     elif args.cmd == "scheduler":
-        jobs.run_scheduler(spotify, store, settings.alert_webhook, once=args.once)
+        jobs.run_scheduler(spotify, store, settings.alert_webhook, once=args.once,
+                           poll_seconds=int(os.getenv("OFFICE_RADIO_POLL_SECONDS", "300")),
+                           after_job=lambda: persist.commit(settings.data_dir))
     elif args.cmd == "create-master":
         pid = maintenance.ensure_master(spotify, store, me, create=True, confirm=args.confirm)
         print("Office Radio playlist:", pid)

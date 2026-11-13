@@ -4,10 +4,12 @@ Jobs:
   discovery       find office playlists                    (default daily)
   source_sync     refresh catalog from source playlists    (default every 6h)
   reconciliation  mirror Office Radio + propose additions  (default daily)
+                  (+ auto-adds Inbox songs if auto_approve_inbox is on)
 
 Each run is recorded in playlist_sync_history. Failures are retried with
 exponential backoff, then a notification is sent. A report is produced after
-every run. Jobs only read from Spotify; writes happen via the admin CLI.
+every run. Jobs only read from Spotify, except the opt-in Inbox auto-approve,
+which adds (never removes) songs to Office Radio when writes are enabled.
 """
 from __future__ import annotations
 
@@ -32,7 +34,8 @@ STALE_RUNNING = 2 * 3600          # a "running" row this old means the process d
 def _reconcile(spotify, store: Store) -> dict:
     active = maintenance.sync_active(spotify, store)
     proposals = maintenance.generate_proposals(store)
-    return {"active": active, "proposals": proposals}
+    auto = maintenance.auto_apply_inbox(spotify, store)
+    return {"active": active, "proposals": proposals, "inbox_auto_approve": auto}
 
 
 JOBS: dict[str, Callable] = {
@@ -135,13 +138,15 @@ def due_jobs(store: Store, now: datetime | None = None) -> list[str]:
 
 
 def run_scheduler(spotify, store: Store, webhook: str | None = None, once: bool = False,
-                  poll_seconds: int = 300) -> None:
+                  poll_seconds: int = 300, after_job: Callable[[], object] | None = None) -> None:
     """Run due jobs in dependency order; repeat. Not continuous polling of Spotify:
     Spotify is only called when a job is due."""
     while True:
         for job in due_jobs(store):  # JOBS order = discovery, sync, reconciliation
             result = run_job(job, spotify, store, webhook)
             log.info("Report after %s: %s", job, json.dumps(result["report"], default=str))
+            if after_job:
+                after_job()  # e.g. save to the Chalk Volume
         if once:
             return
         time.sleep(poll_seconds)

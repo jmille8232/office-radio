@@ -205,3 +205,33 @@ def rollback(spotify, store: Store, change_ids: list[int], actor: str,
             removed.append(r["change_id"])
     sync_active(spotify, store)
     return {"rolled_back": removed}
+
+
+def auto_apply_inbox(spotify, store: Store, actor: str = "auto-approve") -> dict:
+    """If enabled, approve and add pending Inbox songs without an admin.
+
+    Settings:
+      auto_approve_inbox           true/false (default false)
+      auto_approve_hold_explicit   true -> explicit songs wait for manual approval
+    Songs from other source playlists still need manual approval.
+    """
+    if not store.get_setting("auto_approve_inbox", False):
+        return {"enabled": False}
+    if not store.get_setting("writes_enabled", False):
+        log.warning("Inbox auto-approve is on but writes are disabled; skipping.")
+        return {"enabled": True, "skipped": "writes disabled"}
+    hold_explicit = bool(store.get_setting("auto_approve_hold_explicit", False))
+    approved, held = [], []
+    for ch in store.changes(status="pending", action="add"):
+        if ch["source"] != "inbox":
+            continue
+        t = store.one("SELECT explicit FROM candidate_tracks WHERE track_id = ?", (ch["track_id"],))
+        if hold_explicit and t and t["explicit"]:
+            held.append(ch["change_id"])
+            continue
+        store.transition(ch["change_id"], "approved", actor, "auto-approved (inbox)")
+        approved.append(ch["change_id"])
+    result = {"enabled": True, "auto_approved": len(approved), "held_explicit": len(held)}
+    if approved:
+        result["apply"] = apply_approved(spotify, store, actor)
+    return result
